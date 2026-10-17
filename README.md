@@ -102,30 +102,33 @@ curl -X POST "$(terraform output -raw function_url)?code=<function_key>" \
 
 ## Releases
 
-[.github/workflows/release.yml](.github/workflows/release.yml) runs the tests on every push to `main` and every pull request. The **release** job runs only for a version tag or a manual run — a plain push to `main` never creates a release, so its `release` job shows as *skipped*; that is expected.
+[.github/workflows/release.yml](.github/workflows/release.yml) runs the tests on every pull request and push, and **publishes a release with the Azure Functions zip** for everything except pull requests:
 
-It builds an Azure Functions package (`host.json` and `function_app.py` at the zip root, Linux/Python 3.11 dependencies in `.python_packages/lib/site-packages`), checks the layout, uploads it as a workflow artifact, and publishes a GitHub Release with `thumbnail-function-<version>.zip` attached.
+| Trigger | Version | Release type |
+|---|---|---|
+| Merge / push to `main` | `v0.1.<run number>` (automatic) | **pre-release** |
+| Push of a tag `v*` (e.g. `v1.0.0`) | the tag | normal release |
+| **Actions → Release → Run workflow** | the version you enter, or `v0.1.<run number>` if left empty | normal release |
 
-Create a release in one of two ways:
+A pull request run only executes the tests; its `release` job is skipped, which is expected. Run numbers count every run of the workflow, so automatic versions can have gaps.
 
-~~~bash
-# 1. push a tag
-git tag v0.1.0
-git push origin v0.1.0
-~~~
-
-2. Or on GitHub: **Actions → Release → Run workflow**, enter a version such as `v0.1.0`.
-
-Download the zip from the release's *Assets* (or from the run's *Artifacts*), then deploy it:
+Each release contains `thumbnail-function-<version>.zip` (`host.json` and `function_app.py` at the zip root, Linux/Python 3.11 dependencies in `.python_packages/lib/site-packages`). The same zip is also kept as a workflow artifact. Download it from the release's *Assets* and deploy it:
 
 ~~~bash
 az functionapp deployment source config-zip \
   --resource-group <RESOURCE_GROUP> \
   --name <FUNCTION_APP_NAME> \
-  --src thumbnail-function-v0.1.0.zip
+  --src thumbnail-function-v0.1.7.zip
 ~~~
 
 Resource group and app name are Terraform outputs (`resource_group`, `function_name`).
+
+For a deliberate, clean version number, push a tag instead of relying on the automatic pre-release:
+
+~~~bash
+git tag v0.2.0
+git push origin v0.2.0
+~~~
 
 ## Project Structure
 
