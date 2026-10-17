@@ -12,16 +12,13 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version tag (e.g. v0.1.0)"
-        required: true
+        description: "Release version tag (e.g. v0.1.0). Leave empty to auto-generate."
+        required: false
         type: string
-
-permissions:
-  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -43,21 +40,22 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pillow azure-functions azure-storage-blob pytest
+          # same pinned versions that ship in the release zip
+          pip install -r requirements.txt pytest
 
       - name: Run tests
         run: pytest tests/ -v
 
   release:
     needs: test
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
 
     permissions:
       contents: write
 
     env:
-      VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+      INPUT_VERSION: ${{ inputs.version }}
 
     steps:
       - name: Checkout
@@ -65,27 +63,41 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Validate version format
+      - name: Determine release metadata
+        shell: bash
         run: |
-          [[ "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.].*)?$ ]]
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+            PRERELEASE=false
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            if [[ -n "${INPUT_VERSION:-}" ]]; then
+              VERSION="${INPUT_VERSION}"
+            else
+              VERSION="v0.1.${GITHUB_RUN_NUMBER}"
+            fi
+            PRERELEASE=false
+          else
+            VERSION="v0.1.${GITHUB_RUN_NUMBER}"
+            PRERELEASE=true
+          fi
+
+          # Validate BEFORE exporting: a crafted manual input (e.g. with a newline)
+          # must never reach GITHUB_ENV.
+          if ! [[ "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]]; then
+            echo "ERROR: invalid version '${VERSION}' (expected e.g. v0.1.0)" >&2
+            exit 1
+          fi
+
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "PRERELEASE=${PRERELEASE}" >> "${GITHUB_ENV}"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
-
-      - name: Create tag for manual release
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          if git rev-parse "${VERSION}" >/dev/null 2>&1; then
-            echo "Tag ${VERSION} already exists."
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag "${VERSION}" "${GITHUB_SHA}"
-            git push origin "${VERSION}"
-          fi
 
       - name: Build Azure Functions package in staging directory
         run: |
@@ -100,9 +112,6 @@ jobs:
 
           test -f "$APP_DIR/function_app.py"
 
-          # Azure Functions Python package layout:
-          # keep application files at ZIP root and place dependencies under
-          # .python_packages/lib/site-packages for Linux zip deployment.
           mkdir -p "$APP_DIR/.python_packages/lib/site-packages"
 
           python -m pip install --upgrade pip
@@ -142,7 +151,6 @@ jobs:
           set -euo pipefail
 
           unzip -l "$ZIP_NAME"
-
           unzip -l "$ZIP_NAME" | awk '{print $4}' | grep -Fx "host.json"
           unzip -l "$ZIP_NAME" | awk '{print $4}' | grep -Fx "function_app.py"
 
@@ -161,6 +169,7 @@ jobs:
           tag_name: ${{ env.VERSION }}
           target_commitish: ${{ github.sha }}
           generate_release_notes: true
+          prerelease: ${{ env.PRERELEASE }}
           files: ${{ env.ZIP_NAME }}
 
       - name: Print Azure deployment command
