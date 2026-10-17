@@ -9,6 +9,12 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version tag (e.g. v0.1.0)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -20,6 +26,9 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
@@ -40,16 +49,25 @@ jobs:
         run: pytest tests/ -v
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
     needs: test
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
 
     permissions:
       contents: write
 
+    env:
+      VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate version format
+        run: |
+          [[ "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.].*)?$ ]]
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -57,25 +75,79 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Build deployment package
+      - name: Create tag for manual release
+        if: github.event_name == 'workflow_dispatch'
         run: |
-          chmod +x ./scripts/build.sh
-          ./scripts/build.sh
+          if git rev-parse "${VERSION}" >/dev/null 2>&1; then
+            echo "Tag ${VERSION} already exists."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag "${VERSION}" "${GITHUB_SHA}"
+            git push origin "${VERSION}"
+          fi
 
-      - name: Create release ZIP
+      - name: Build Azure Functions package in staging directory
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          ZIP_NAME="thumbnail-function-${TAG}.zip"
+          set -euo pipefail
 
-          cd src
-          zip -r "../${ZIP_NAME}" . \
-            -x "*/__pycache__/*" \
-            -x "__pycache__/*" \
-            -x "*.pyc"
+          STAGE="$(mktemp -d)"
+          APP_DIR="$STAGE/app"
 
-          cd ..
+          mkdir -p "$APP_DIR"
 
-          echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
+          cp -a src/. "$APP_DIR/"
+
+          test -f "$APP_DIR/function_app.py"
+
+          # Azure Functions Python package layout:
+          # keep application files at ZIP root and place dependencies under
+          # .python_packages/lib/site-packages for Linux zip deployment.
+          mkdir -p "$APP_DIR/.python_packages/lib/site-packages"
+
+          python -m pip install --upgrade pip
+
+          pip install \
+            --target "$APP_DIR/.python_packages/lib/site-packages" \
+            --platform manylinux2014_x86_64 \
+            --implementation cp \
+            --python-version 3.11 \
+            --only-binary=:all: \
+            --upgrade \
+            -r requirements.txt
+
+          if [ ! -f "$APP_DIR/host.json" ]; then
+            echo "ERROR: src/host.json is missing from the repository."
+            exit 1
+          fi
+
+          ZIP_NAME="thumbnail-function-${VERSION}.zip"
+
+          (
+            cd "$APP_DIR"
+
+            find . -type d -name "__pycache__" -prune -exec rm -rf {} +
+            find . -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete
+
+            zip -r "$GITHUB_WORKSPACE/$ZIP_NAME" . \
+              -x "*/__pycache__/*" \
+              -x "*.pyc" \
+              -x "*.pyo"
+          )
+
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+
+      - name: Verify package structure
+        run: |
+          set -euo pipefail
+
+          unzip -l "$ZIP_NAME"
+
+          unzip -l "$ZIP_NAME" | awk '{print $4}' | grep -Fx "host.json"
+          unzip -l "$ZIP_NAME" | awk '{print $4}' | grep -Fx "function_app.py"
+
+          echo "Archive size:"
+          ls -lh "$ZIP_NAME"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -86,5 +158,14 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
           files: ${{ env.ZIP_NAME }}
+
+      - name: Print Azure deployment command
+        run: |
+          echo "az functionapp deployment source config-zip \\"
+          echo "  --resource-group <RESOURCE_GROUP> \\"
+          echo "  --name <FUNCTION_APP_NAME> \\"
+          echo "  --src ${ZIP_NAME}"

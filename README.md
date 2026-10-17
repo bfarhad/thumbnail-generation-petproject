@@ -102,20 +102,39 @@ curl -X POST "$(terraform output -raw function_url)?code=<function_key>" \
 
 ## Releases
 
-Pushing a tag that starts with `v` runs [.github/workflows/release.yml](.github/workflows/release.yml): it runs the tests, builds the deployment package with `scripts/build.sh`, zips the contents of `src/` as `thumbnail-function-<tag>.zip`, and publishes a GitHub Release with that zip attached and generated release notes. Pull requests and pushes to `main` only run the tests.
+[.github/workflows/release.yml](.github/workflows/release.yml) runs the tests on every push to `main` and every pull request. The **release** job runs only for a version tag or a manual run — a plain push to `main` never creates a release, so its `release` job shows as *skipped*; that is expected.
+
+It builds an Azure Functions package (`host.json` and `function_app.py` at the zip root, Linux/Python 3.11 dependencies in `.python_packages/lib/site-packages`), checks the layout, uploads it as a workflow artifact, and publishes a GitHub Release with `thumbnail-function-<version>.zip` attached.
+
+Create a release in one of two ways:
 
 ~~~bash
+# 1. push a tag
 git tag v0.1.0
 git push origin v0.1.0
 ~~~
+
+2. Or on GitHub: **Actions → Release → Run workflow**, enter a version such as `v0.1.0`.
+
+Download the zip from the release's *Assets* (or from the run's *Artifacts*), then deploy it:
+
+~~~bash
+az functionapp deployment source config-zip \
+  --resource-group <RESOURCE_GROUP> \
+  --name <FUNCTION_APP_NAME> \
+  --src thumbnail-function-v0.1.0.zip
+~~~
+
+Resource group and app name are Terraform outputs (`resource_group`, `function_name`).
 
 ## Project Structure
 
 ~~~text
 thumbnail-generation-petproject/
 ├── src/
-│   └── function_app.py
-│       └── Azure Functions v2 application
+│   ├── function_app.py
+│   │   └── Azure Functions v2 application
+│   └── host.json
 │
 ├── terraform/
 │   ├── versions.tf
